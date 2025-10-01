@@ -1,289 +1,258 @@
-# src/rl_env.py
 import numpy as np
 import pandas as pd
 import gymnasium as gym
+from gymnasium import spaces
 
 class RLEnvBESS(gym.Env):
     """
-    PPO-friendly environment for Huawei Tech Arena Phase I (capacity-only FCR/aFRR), 15-min steps.
-
-    Input file (combined_prices.csv) must have columns like:
-      Timestamp, DA_DE_LU, DA_AT, DA_CH, DA_HU, DA_CZ,
-      DE, AT, CH, HU, CZ,                       # FCR prices (plain country codes)
-      DE_Pos, DE_Neg, AT_Pos, AT_Neg, ...       # aFRR capacity prices
-
-    Action (continuous, scaled to [-1,1]):
-      a[0] -> P_net (MW) in [-P_max, +P_max] (negative = charge, positive = discharge)
-      a[1] -> rFCR (MW) in [0, P_max]
-      a[2] -> rPOS (MW) in [0, P_max]
-      a[3] -> rNEG (MW) in [0, P_max]
-
-    Safety layer enforces:
-      - SoC bounds (E_min..E_hi)
-      - Power budget: |P_net| + rFCR + rPOS + rNEG ≤ P_max
-      - Daily cycles cap (calendar day): throughput ≤ 2*E_max*cycles_per_day
-      - 4-hour capacity hold: capacities only change at block boundaries (every 16 steps)
-
-    Reward per step:
-      r = DA_price * (dis_mwh - ch_mwh) + (FCR*cap_FCR + aPOS*cap_POS + aNEG*cap_NEG)/16
-      (Divide capacity block price by 16 to allocate per 15-min step.)
-
-    Note: If you enabled price normalization, rewards are on a normalized scale (fine for learning).
+    Minimal BESS env for Phase I:
+    - Observation: [SoC, DA price (country), FCR, aFRR_pos, aFRR_neg] + time-of-day (sin/cos)
+    - Action: continuous [P_net_MW, FCR_MW, aFRR_pos_MW, aFRR_neg_MW]
+      where P_net_MW >0 is discharge to grid (sell), <0 is charge from grid (buy)
+    - Reward: revenue per 15-min step (DA arbitrage + capacity payments)
+    - Safety layer enforces SoC, power budget, 4h constant reserves, daily FCE cap
     """
+    metadata = {"render.modes": []}
 
-    metadata = {"render_modes": []}
-
-    def __init__(
-        self,
-        combined_csv: str,
-        country: str = "DE",          # one of {"DE","AT","CH","HU","CZ"}
-        E_max_MWh: float = 10.0,      # energy capacity (MWh)
-        C_rate: float = 0.5,          # P_max = C_rate * E_max (MW)
-        soc_min: float = 0.10,        # lower SoC bound (fraction of E_max)
-        soc_max: float = 0.90,        # upper SoC bound (fraction of E_max)
-        eta_c: float = 0.95,          # charge efficiency (≈ sqrt(0.90))
-        eta_d: float = 0.95,          # discharge efficiency
-        daily_fce_cap: float = 1.0,   # full cycles/day cap (calendar day)
-        train_slice: slice | None = None,  # slice of rows for training (e.g., slice(0, 20000))
-        normalize_prices: bool = True,
-    ):
+    def __init__(self,
+                 combined_csv: str,
+                 country: str,
+                 E_max_MWh: float,
+                 C_rate: float,
+                 soc_min: float = 0.10,
+                 soc_max: float = 0.90,
+                 eta_c: float = 0.95,
+                 eta_d: float = 0.95,
+                 daily_fce_cap: float = 1.0,
+                 train_slice=None,
+                 normalize_prices: bool = True):
         super().__init__()
+        # --- load & slice data ---
+        self.df = pd.read_csv(combined_csv, parse_dates=["Timestamp"]).sort_values("Timestamp").reset_index(drop=True)
+        self.country = country
+        self.da_col  = {"DE":"DA_DE_LU","AT":"DA_AT","CH":"DA_CH","HU":"DA_HU","CZ":"DA_CZ"}[country]
+        self.fcr_col = country
+        self.pos_col = f"{country}_Pos"
+        self.neg_col = f"{country}_Neg"
+        for c in [self.da_col, self.fcr_col, self.pos_col, self.neg_col]:
+            if c not in self.df.columns:
+                raise ValueError(f"Missing column: {c}")
 
-        # -------- Load & basic clean ----------
-        self.df = pd.read_csv(combined_csv, parse_dates=["Timestamp"])
-        self.df.sort_values("Timestamp", inplace=True, ignore_index=True)
-
-        # Treat missing capacity prices as zero (FAQ: missing CH FCR can be assumed 0)
-        for c in self.df.columns:
-            if c in ("DE","AT","CH","HU","CZ") or c.endswith("_Pos") or c.endswith("_Neg"):
-                self.df[c] = self.df[c].fillna(0.0)
-
-        # -------- Column mapping for your header style ----------
-        da_map = {"DE": "DA_DE_LU", "AT": "DA_AT", "CH": "DA_CH", "HU": "DA_HU", "CZ": "DA_CZ"}
-        fcr_map = {"DE": "DE",       "AT": "AT",    "CH": "CH",    "HU": "HU",    "CZ": "CZ"}
-        pos_map = {c: f"{c}_Pos" for c in fcr_map}
-        neg_map = {c: f"{c}_Neg" for c in fcr_map}
-
-        if country not in da_map:
-            raise ValueError(f"country must be one of {list(da_map.keys())}")
-
-        self.da_col  = da_map[country]
-        self.fcr_col = fcr_map[country]
-        self.pos_col = pos_map[country]
-        self.neg_col = neg_map[country]
-
-        needed = ["Timestamp", self.da_col, self.fcr_col, self.pos_col, self.neg_col]
-        missing = [c for c in needed if c not in self.df.columns]
-        if missing:
-            raise ValueError(f"Missing columns in combined_prices.csv: {missing}")
-
-        # Keep only required cols and normalize names internally
-        self.df = self.df[needed].copy()
-        self.df.rename(columns={
-            self.da_col: "DA",
-            self.fcr_col: "FCR",
-            self.pos_col: "aPOS",
-            self.neg_col: "aNEG"
-        }, inplace=True)
-
-        # -------- Optional price normalization (helps PPO) ----------
-        if normalize_prices:
-            for c in ["DA","FCR","aPOS","aNEG"]:
-                s = self.df[c].values.astype(float)
-                mu, sd = np.nanmean(s), np.nanstd(s) + 1e-9
-                self.df[c] = (s - mu) / sd
-
-        # -------- Time features ----------
-        ts = self.df["Timestamp"]
-        self.df["minute_of_day"] = ts.dt.hour * 60 + ts.dt.minute
-        self.df["dow"] = ts.dt.dayofweek
-        # 4-hour blocks: every 16 steps of 15 min
-        self.dt_h = 0.25
-        self.block_idx = np.floor(np.arange(len(self.df)) / 16).astype(int)
-        self.df["block_idx"] = self.block_idx
-
-        # Apply training slice if given
         if train_slice is not None:
             self.df = self.df.iloc[train_slice].reset_index(drop=True)
-            self.block_idx = self.df["block_idx"].values
 
-        # -------- Battery params & caps ----------
+        # --- battery & step config ---
         self.E_max = float(E_max_MWh)
-        self.E_min = float(soc_min * E_max_MWh)
-        self.E_hi  = float(soc_max * E_max_MWh)
-        self.P_max = float(C_rate * E_max_MWh)
-        self.eta_c = float(eta_c)
-        self.eta_d = float(eta_d)
-        self.daily_throughput_cap = float(2.0 * E_max_MWh * daily_fce_cap)
+        self.C_rate = float(C_rate)
+        self.P_max = self.E_max * self.C_rate
+        self.soc_min, self.soc_max = float(soc_min), float(soc_max)
+        self.eta_c, self.eta_d = float(eta_c), float(eta_d)
+        self.FCE = float(daily_fce_cap)
+        self.DT_H = 0.25  # 15 minutes
 
-        # -------- Gym spaces ----------
-        # Actions in [-1,1]; we rescale inside
-        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
-        # Observation: [SoC(0..1), DA, FCR, aPOS, aNEG, minute/1440, dow/6, steps_to_block_end/16]
-        self.observation_space = gym.spaces.Box(low=-10, high=10, shape=(8,), dtype=np.float32)
+        # --- price normalization for observations only ---
+        self.normalize_prices = normalize_prices
+        if self.normalize_prices:
+            for col in [self.da_col, self.fcr_col, self.pos_col, self.neg_col]:
+                m = float(pd.to_numeric(self.df[col], errors="coerce").mean())
+                s = float(pd.to_numeric(self.df[col], errors="coerce").std())
+                if not np.isfinite(m):
+                    m = 0.0
+                if (not np.isfinite(s)) or s == 0.0:
+                    s = 1.0
+                self.df[col+"_norm_mean"] = m
+                self.df[col+"_norm_std"]  = s
+                self.df[col+"_norm"]      = (pd.to_numeric(self.df[col], errors="coerce") - m) / s
 
-        # -------- Runtime state ----------
-        self.t = 0
-        self.E = None
-        self.todays_date = None
-        self.today_throughput = 0.0
-        self.curr_block = None
-        self.cap_FCR = 0.0
-        self.cap_POS = 0.0
-        self.cap_NEG = 0.0
+        # --- Gym spaces ---
+        # obs: SoC, DA, FCR, POS, NEG, sin_t, cos_t
+        high_obs = np.array([1.0, 10.0, 10.0, 10.0, 10.0, 1.0, 1.0], dtype=np.float32)
+        self.observation_space = spaces.Box(low=-high_obs, high=high_obs, dtype=np.float32)
+        # act: P_net (MW), FCR (MW), POS (MW), NEG (MW)
+        self.action_space = spaces.Box(
+            low=np.array([-self.P_max, 0.0, 0.0, 0.0], dtype=np.float32),
+            high=np.array([ self.P_max, self.P_max, self.P_max, self.P_max], dtype=np.float32),
+            dtype=np.float32
+        )
 
-    # ----------------- Core helpers -----------------
+        # --- state trackers ---
+        self.reset()
 
-    def _obs(self):
-        row = self.df.iloc[self.t]
-        soc = float(np.clip(self.E / self.E_max, 0.0, 1.0))
-        steps_left = 16 - (self.t % 16)  # to next block boundary
-        return np.array([
-            soc,
-            float(row["DA"]), float(row["FCR"]), float(row["aPOS"]), float(row["aNEG"]),
-            row["minute_of_day"] / 1440.0,
-            row["dow"] / 6.0,
-            steps_left / 16.0
-        ], dtype=np.float32)
+    # ============================
+    # Helpers
+    # ============================
+    def _get_obs(self, t_idx):
+        row = self.df.iloc[t_idx]
+        if self.normalize_prices:
+            da  = row[self.da_col+"_norm"]
+            fcr = row[self.fcr_col+"_norm"]
+            pos = row[self.pos_col+"_norm"]
+            neg = row[self.neg_col+"_norm"]
+        else:
+            da  = row[self.da_col]
+            fcr = row[self.fcr_col]
+            pos = row[self.pos_col]
+            neg = row[self.neg_col]
 
-    def reset(self, seed=None, options=None):
+        # time-of-day features
+        ts = row["Timestamp"]
+        minutes = ts.hour*60 + ts.minute
+        ang = 2*np.pi*minutes/(24*60)
+        sin_t, cos_t = np.sin(ang), np.cos(ang)
+
+        obs = np.array([self.soc, da, fcr, pos, neg, sin_t, cos_t], dtype=np.float32)
+        # Ensure NaN/Inf-free observation
+        obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        return obs
+
+    # ============================
+    # Gym API
+    # ============================
+    def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.t = 0
-        # start mid-band
-        self.E = self.E_min + 0.5 * (self.E_hi - self.E_min)
-        self.todays_date = self.df.loc[0, "Timestamp"].date()
-        self.today_throughput = 0.0
-        self.curr_block = self.block_idx[0]
-        self.cap_FCR = self.cap_POS = self.cap_NEG = 0.0
-        return self._obs(), {}
+        self.soc = 0.5              # start mid-SOC (free end SOC per FAQ)
+        self.energy_MWh = self.E_max * self.soc
+        self.throughput_today = 0.0 # sum of |charge| + |discharge| MWh today
+        self.current_day = self.df.iloc[0]["Timestamp"].date()
+        self._res_block_base = None # (block_index, FCR, POS, NEG)
+        obs = self._get_obs(self.t)
+        return obs, {}
 
-    def _apply_safety_layer(self, a_raw):
+    def _apply_safety_layer(self, a):
         """
-        Convert raw action in [-1,1]^4 to feasible (P_net, caps, ch_mwh, dis_mwh).
-        Priority: keep capacities as chosen; scale P_net to fit power budget.
-        (You can invert this priority if you prefer arbitrage over capacity.)
+        Project action into feasible region:
+          - 4h constancy of reserves (exact within block)
+          - power budget (preliminary before SoC/efficiencies)
+          - daily FCE strict cap (per calendar day)
         """
-        # Rescale desired actions
-        P_net_des = float(a_raw[0]) * self.P_max                  # [-P_max, +P_max]
-        rFCR_des  = float((a_raw[1] + 1) / 2) * self.P_max       # [0, P_max]
-        rPOS_des  = float((a_raw[2] + 1) / 2) * self.P_max
-        rNEG_des  = float((a_raw[3] + 1) / 2) * self.P_max
+        P_net, cap_FCR, cap_POS, cap_NEG = map(float, a)
 
-        # 4h capacity hold: only adopt new capacities at block boundary
-        block = self.block_idx[self.t]
-        if block != self.curr_block:
-            cap_FCR = rFCR_des
-            cap_POS = rPOS_des
-            cap_NEG = rNEG_des
+        # ---- 4h-block exact constancy (each block = 16 steps) ----
+        blk = self.t // 16
+        if self._res_block_base is None or self._res_block_base[0] != blk:
+            # store exact block values at the beginning of the block
+            self._res_block_base = (blk, float(cap_FCR), float(cap_POS), float(cap_NEG))
         else:
-            cap_FCR = self.cap_FCR
-            cap_POS = self.cap_POS
-            cap_NEG = self.cap_NEG
+            # overwrite with stored block values (no drift within the block)
+            _, bF, bP, bN = self._res_block_base
+            cap_FCR, cap_POS, cap_NEG = float(bF), float(bP), float(bN)
 
-        # Power budget
-        over = abs(P_net_des) + cap_FCR + cap_POS + cap_NEG - self.P_max
-        if over > 0:
-            # scale down P_net to fit (capacity-first priority)
-            P_net_des = np.sign(P_net_des) * max(0.0, self.P_max - (cap_FCR + cap_POS + cap_NEG))
+        # ---- preliminary power budget (headroom before SoC/eff) ----
+        cap_FCR = float(np.clip(cap_FCR, 0.0, self.P_max))
+        cap_POS = float(np.clip(cap_POS, 0.0, self.P_max))
+        cap_NEG = float(np.clip(cap_NEG, 0.0, self.P_max))
+        cap_sum = max(0.0, cap_FCR + cap_POS + cap_NEG)
+        # P_net is limited by remaining headroom
+        P_net = float(np.clip(P_net, -self.P_max + cap_sum, self.P_max - cap_sum))
 
-        # Enforce SoC bounds via feasible ch/dis (MWh this step)
-        if P_net_des < 0:  # charging
-            req_ch = -P_net_des * self.dt_h
-            headroom = (self.E_hi - self.E) / self.eta_c
-            ch_mwh = max(0.0, min(req_ch, headroom))
-            dis_mwh = 0.0
-            P_net = - ch_mwh / self.dt_h
-        else:              # discharging
-            req_dis = P_net_des * self.dt_h
-            avail = (self.E - self.E_min) * self.eta_d
-            dis_mwh = max(0.0, min(req_dis, avail))
-            ch_mwh = 0.0
-            P_net = dis_mwh / self.dt_h
+        # ---- strict daily FCE cap gate (per calendar day) ----
+        rem = 2.0 * self.E_max * self.FCE - self.throughput_today  # remaining MWh for the day
+        if rem <= 0.0:
+            P_net = 0.0
+        else:
+            E_step_abs = abs(P_net) * self.DT_H
+            if E_step_abs > rem + 1e-12:
+                P_net *= rem / (E_step_abs + 1e-12)
 
-        # Daily throughput cap (calendar day)
-        remaining = self.daily_throughput_cap - self.today_throughput
-        step_throughput = ch_mwh + dis_mwh
-        if step_throughput > remaining + 1e-12:
-            scale = max(0.0, remaining / (step_throughput + 1e-9))
-            ch_mwh *= scale
-            dis_mwh *= scale
-            P_net = (dis_mwh - ch_mwh) / self.dt_h
-
-        return P_net, cap_FCR, cap_POS, cap_NEG, ch_mwh, dis_mwh
-
-    # ----------------- Gym API -----------------
+        return np.array([P_net, cap_FCR, cap_POS, cap_NEG], dtype=np.float32)
 
     def step(self, action):
-        # Rollover daily throughput counter at midnight
-        date = self.df.loc[self.t, "Timestamp"].date()
-        if self.todays_date != date:
-            self.todays_date = date
-            self.today_throughput = 0.0
+        a = np.array(action, dtype=np.float32)
+        a = self._apply_safety_layer(a)
+        P_net, cap_FCR, cap_POS, cap_NEG = map(float, a)  # MW (P_net + means discharge)
 
-        # Project action to feasible region
-        P_net, cap_FCR, cap_POS, cap_NEG, ch_mwh, dis_mwh = self._apply_safety_layer(action)
-
-        # Energy update with efficiency
-        self.E = self.E + self.eta_c * ch_mwh - (dis_mwh / self.eta_d)
-        self.E = float(np.clip(self.E, self.E_min, self.E_hi))
-        self.today_throughput += (ch_mwh + dis_mwh)
-
-        # Adopt new capacities only at block boundaries
-        block = self.df.loc[self.t, "block_idx"]
-        if block != self.curr_block:
-            self.curr_block = block
-            self.cap_FCR, self.cap_POS, self.cap_NEG = cap_FCR, cap_POS, cap_NEG
-        # Use current committed capacities
-        cap_FCR, cap_POS, cap_NEG = self.cap_FCR, self.cap_POS, self.cap_NEG
-
-        # Reward components
         row = self.df.iloc[self.t]
-        r_da  = float(row["DA"])   * (dis_mwh - ch_mwh)
-        r_cap = (float(row["FCR"]) * cap_FCR +
-                 float(row["aPOS"]) * cap_POS +
-                 float(row["aNEG"]) * cap_NEG) / 16.0
-        reward = r_da + r_cap
 
+        # --- convert P_net to energy with SoC limits (battery side, no eff losses inside battery) ---
+        P_dis_des = max(0.0, P_net)   # MW to grid (desired)
+        P_ch_des  = max(0.0,-P_net)   # MW from grid (desired)
+
+        # energy limited by SoC room/availability (battery side)
+        E_dis_MWh = min(P_dis_des * self.DT_H, self.energy_MWh)                       # discharge available
+        E_ch_MWh  = min(P_ch_des  * self.DT_H, (self.E_max - self.energy_MWh))        # room to charge
+
+        # --- update SoC (battery side state) ---
+        self.energy_MWh = self.energy_MWh - E_dis_MWh + E_ch_MWh
+        self.energy_MWh = float(np.clip(self.energy_MWh, self.E_max*self.soc_min, self.E_max*self.soc_max))
+        self.soc = self.energy_MWh / self.E_max
+
+        # --- throughput accumulation (for daily cap) ---
+        self.throughput_today += (E_dis_MWh + E_ch_MWh)
+
+        # --- day roll (calendar day) ---
+        cur_date = row["Timestamp"].date()
+        if cur_date != self.current_day:
+            self.current_day = cur_date
+            self.throughput_today = 0.0
+
+        # --- raw prices for reward ---
+        DA  = float(row[self.da_col])
+        FCR = float(row[self.fcr_col])
+        POS = float(row[self.pos_col])
+        NEG = float(row[self.neg_col])
+
+        # --- grid-side power with efficiencies (what hits the grid) ---
+        # Convert the realized battery-side energies to grid MW
+        P_dis_grid = (E_dis_MWh / self.DT_H) * self.eta_d   # discharge reduced by eff to grid
+        P_ch_grid  = (E_ch_MWh  / self.DT_H) / self.eta_c   # charge increased on grid side
+        p_grid = P_dis_grid - P_ch_grid                     # net MW to grid (+ out / - in)
+
+        # --- enforce final power budget: |p_grid| + reserves <= P_max (strict) ---
+        head = self.P_max - abs(p_grid)
+        if head < 0.0:
+            # If impossible (shouldn't happen), zero reserves strictly
+            cap_FCR = cap_POS = cap_NEG = 0.0
+            head = 0.0
+        cap_total = cap_FCR + cap_POS + cap_NEG
+        if cap_total > head + 1e-12:
+            scale = max(0.0, head) / max(cap_total, 1e-12)
+            cap_FCR *= scale; cap_POS *= scale; cap_NEG *= scale
+
+        # --- compute revenues per 15-min ---
+        rev_DA  = DA  * (E_dis_MWh - E_ch_MWh)   # €/MWh * MWh (battery-side energy transacted)
+        # capacity payments ~ €/MW per 4h → per 15-min (divide by 16)
+        rev_FCR = (FCR * cap_FCR) / 16.0
+        rev_POS = (POS * cap_POS) / 16.0
+        rev_NEG = (NEG * cap_NEG) / 16.0
+        reward = float(rev_DA + rev_FCR + rev_POS + rev_NEG)
+
+        # --- step forward ---
         self.t += 1
-        terminated = (self.t >= len(self.df))
-        truncated = False
-        obs = self._obs() if not terminated else np.zeros(self.observation_space.shape, dtype=np.float32)
-
+        done = (self.t >= len(self.df))
+        obs = self._get_obs(min(self.t, len(self.df)-1))
         info = {
-            "P_net": P_net,
-            "ch_mwh": ch_mwh, "dis_mwh": dis_mwh,
+            "E_dis_MWh": E_dis_MWh, "E_ch_MWh": E_ch_MWh,
             "cap_FCR": cap_FCR, "cap_POS": cap_POS, "cap_NEG": cap_NEG,
-            "reward_da": r_da, "reward_cap": r_cap,
+            "rev": reward
         }
-        return obs, float(reward), bool(terminated), bool(truncated), info
+        return obs, reward, done, False, info
 
-    # ----------------- Export helper -----------------
-
-    def rollout_to_operation(self, policy, out_csv: str):
-        """
-        Roll a trained policy deterministically over the *current* df and export Operation.csv.
-        (Assumes this env was created with the full-year data and same normalization as training.)
-        """
-        records = []
+    # ---------- exporter used in rollout ----------
+    def rollout_to_operation(self, model, out_csv: str):
+        out = []
         obs, _ = self.reset()
-        while True:
-            act, _ = policy.predict(obs, deterministic=True)
-            obs, rew, done, trunc, info = self.step(act)
-            idx = max(self.t - 1, 0)
-            ts = self.df.loc[idx, "Timestamp"]
-            soc = float(np.clip(self.E / self.E_max, 0.0, 1.0))
-            records.append({
-                "Timestamp": ts,
-                "Stored energy [MWh]": float(self.E),
-                "SoC [-]": soc,
-                "Charge [MWh]": float(info["ch_mwh"]),
-                "Discharge [MWh]": float(info["dis_mwh"]),
-                "Day-ahead buy [MWh]": float(info["ch_mwh"]),
-                "Day-ahead sell [MWh]": float(info["dis_mwh"]),
-                "FCR Capacity [MW]": float(info["cap_FCR"]),
-                "aFRR Capacity POS [MW]": float(info["cap_POS"]),
-                "aFRR Capacity NEG [MW]": float(info["cap_NEG"]),
+        done = False
+        t_local = 0
+        while not done:
+            act, _ = model.predict(obs, deterministic=True)
+            obs, r, done, trunc, info = self.step(act)
+
+            row = self.df.iloc[t_local]
+            out.append({
+                "Timestamp": row["Timestamp"],
+                "Stored energy [MWh]": round(self.energy_MWh, 4),
+                "SoC [-]": round(self.soc, 5),
+                "Charge [MWh]": round(info["E_ch_MWh"], 5),
+                "Discharge [MWh]": round(info["E_dis_MWh"], 5),
+                "Day-ahead buy [MWh]": round(info["E_ch_MWh"], 5),
+                "Day-ahead sell [MWh]": round(info["E_dis_MWh"], 5),
+                "FCR Capacity [MW]": round(info["cap_FCR"], 5),
+                "aFRR Capacity POS [MW]": round(info["cap_POS"], 5),
+                "aFRR Capacity NEG [MW]": round(info["cap_NEG"], 5),
             })
-            if done or trunc:
-                break
-        pd.DataFrame(records).to_csv(out_csv, index=False)
+            t_local += 1
+
+        df = pd.DataFrame(out)
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+        df.to_csv(out_csv, index=False)

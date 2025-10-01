@@ -1,1 +1,50 @@
 Files/
+# ------------------------
+# Python
+# ------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.egg-info/
+.venv/
+env/
+venv/
+
+# ------------------------
+# Logs & checkpoints
+# ------------------------
+*.log
+*.out
+*.err
+*.txt
+tb_logs/
+ckpts_*/
+
+# ------------------------
+# Models
+# ------------------------
+models/*.zip
+
+# ------------------------
+# Outputs (intermediate)
+# ------------------------
+output/_tmp_*.csv
+output/_cfg_*.csv
+output/combined_prices*.csv
+
+# ------------------------
+# Only keep final deliverables
+# ------------------------
+!output/TechArena_Phase1_Operation.csv
+!output/TechArena_Phase1_Configuration.csv
+!output/TechArena_Phase1_Investment.csv
+
+# ------------------------
+# OS / IDE files
+# ------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

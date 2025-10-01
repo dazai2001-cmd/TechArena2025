@@ -1,0 +1,16 @@
+# Core
+pandas
+numpy
+openpyxl
+
+# RL & Gym
+stable-baselines3
+torch
+gymnasium
+
+# Visualization & Debugging
+matplotlib
+tensorboard
+
+# Optional but useful
+scipy
